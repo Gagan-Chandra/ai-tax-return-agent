@@ -11,6 +11,7 @@ from typing import Dict, Any
 import pdfplumber
 import pytesseract
 from PIL import Image
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -44,7 +45,11 @@ GROQ_VISION_MODEL = os.getenv(
     # replace with exact Groq model ID if needed
     "llava-v1.5-7b-4096-preview",
 )
-GROQ_API_KEY = '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'
+GROQ_API_KEY = (
+        st.secrets.get("API_KEY")
+        if hasattr(st, "secrets") and "API_KEY" in st.secrets
+        else os.getenv("API_KEY", "")
+    )
 
 if GROQ_API_KEY:
     try:

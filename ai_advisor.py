@@ -1,6 +1,7 @@
 # ai_advisor.py
 
 import os
+import streamlit as st
 from typing import Dict, Any
 
 try:
@@ -12,18 +13,20 @@ except ImportError:
 def _get_groq_client():
     """
     Return a Groq client if the GROQ_API_KEY is configured.
-    Otherwise return None and let the caller handle it.
+    Otherwise return None and an error string.
     """
     if Groq is None:
-        return None, "groq-python library is not installed. Run: pip install groq"
+        return None, "groq-python library is not installed. Add 'groq' to requirements.txt."
 
-    # Prefer environment variable for safety; fall back to hardcoded if you want.
-    api_key = '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'
-    # If you really want to hardcode, uncomment this and comment out the line above:
-    # api_key = "YOUR_GROQ_KEY_HERE"
+    # Prefer Streamlit secrets, then environment
+    api_key = (
+        st.secrets.get("API_KEY")
+        if hasattr(st, "secrets") and "API_KEY" in st.secrets
+        else os.getenv("GROQ_API_KEY", "")
+    )
 
     if not api_key:
-        return None, "GROQ_API_KEY environment variable is not set."
+        return None, "GROQ_API_KEY is not set in Streamlit Secrets or environment."
 
     try:
         client = Groq(api_key=api_key)
