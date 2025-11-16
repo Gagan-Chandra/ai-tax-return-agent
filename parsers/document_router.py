@@ -65,6 +65,68 @@ if GROQ_API_KEY:
 else:
     logger.info("GROQ_API_KEY not set. LLM parsing via Groq is disabled.")
 
+# in document_router.py (or a separate groq_vision_ocr.py)
+from typing import Tuple
+
+def extract_text_with_groq_vision(file_bytes: bytes) -> Tuple[str, str]:
+    """
+    Try Groq Vision to read the PDF.
+    Returns (text, status_string).
+    status_string examples:
+      - 'GROQ_VISION_OK'
+      - 'GROQ_VISION_DISABLED: <reason>'
+      - 'GROQ_VISION_ERROR: <error...>'
+    """
+    from ai_advisor import _get_groq_client  # or duplicate the same helper
+
+    client, err = _get_groq_client()
+    if err:
+        return "", f"GROQ_VISION_DISABLED: {err}"
+
+    try:
+        b64_pdf = base64.b64encode(file_bytes).decode("utf-8")
+        completion = client.chat.completions.create(
+            model="llama-3.2-90b-vision-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an OCR engine for US tax forms. Extract all visible text."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Extract all text from this tax document PDF. Preserve line breaks."
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": {
+                                "url": f"data:application/pdf;base64,{b64_pdf}"
+                            }
+                        },
+                    ],
+                },
+            ],
+            temperature=0.0,
+            max_tokens=4096,
+        )
+
+        content = completion.choices[0].message.content
+        if isinstance(content, list):
+            text = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        else:
+            text = str(content)
+
+        return text, "GROQ_VISION_OK"
+
+    except Exception as e:
+        return "", f"GROQ_VISION_ERROR: {e}"
+
+
 
 # =====================================================
 # 3. Text + OCR extraction
@@ -873,28 +935,23 @@ def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
 def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]:
     """
     Main entrypoint called from app.py.
-
-    - If use_llm=True and Groq is configured, we try LLM vision parsing first.
-    - If that fails (or use_llm=False), we fall back to the existing
-      pdfplumber/OCR + regex-based parsing you already had.
     """
+    parser_used = "LEGACY"
 
-    # 1) Optional Groq LLM path
     if use_llm:
-        try:
-            logger.info("Using Groq LLM parsing path for this document.")
-            return _groq_llm_extract_from_pdf(file_bytes)
-        except Exception as e:
-            logger.error(
-                "Groq LLM parsing failed, falling back to rule-based parsing: %s",
-                e,
-            )
+        llm_text, status = extract_text_with_groq_vision(file_bytes)
+        if status == "GROQ_VISION_OK" and llm_text.strip():
+            raw_text = llm_text
+            parser_used = "GROQ_VISION"
+        else:
+            # Fallback to normal pipeline
+            raw_text = extract_text_from_pdf(file_bytes)
+            parser_used = status  # so UI can show *why* LLM wasn’t used
+    else:
+        raw_text = extract_text_from_pdf(file_bytes)
 
-    # 2) Existing rule-based / OCR path (unchanged behavior)
-    raw_text = extract_text_from_pdf(file_bytes)
     logger.info("First 500 chars of extracted text:\n%s", raw_text[:500])
     doc_type = detect_document_type(raw_text)
-
     logger.info("Detected document type: %s", doc_type)
 
     if doc_type == "W-2":
@@ -911,14 +968,13 @@ def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]
             "nonemployee_income": 0.0,
             "federal_withholding": 0.0,
         }
-        logger.warning(
-            "Parsed document_type=UNKNOWN but all numeric fields are zero. "
-            "Document may be blank, scanned/low-quality, or unsupported."
-        )
+
+    # attach parser_used so app.py can display it
+    parsed["parser_used"] = parser_used
 
     return {
         "document_type": parsed["document_type"],
         "parsed": parsed,
         "raw_text": raw_text,
-        "parser_used": ("GROQ_LLM" if use_llm else "RULE_BASED"),
     }
+

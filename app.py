@@ -1125,6 +1125,11 @@ if results is not None:
                     f"Parser used: `{parser_label}`"
                 )
                 st.write("Parsed fields used from this file:")
+                if "GROQ_VISION_DISABLED" in file_result["parsed"].get("parser_used", ""):
+                    st.warning("Groq Vision was not available in this deployment. "
+                            "Check GROQ_API_KEY and requirements.txt.")
+                elif "GROQ_VISION_ERROR" in file_result["parsed"].get("parser_used", ""):
+                    st.warning(f"Groq Vision error: {file_result['parsed']['parser_used']}")
 
                 # Mask SSN if present before showing parsed data
                 parsed_safe = dict(file_result["parsed"])
