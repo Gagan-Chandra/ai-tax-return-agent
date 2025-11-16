@@ -4,3 +4,4 @@ pytesseract
 Pillow
 reportlab
 PyPDF2
+groq

@@ -3,6 +3,8 @@
 import io
 import re
 import os
+import json
+import base64
 import logging
 from typing import Dict, Any
 
@@ -15,11 +17,14 @@ if not logger.handlers:
     logger.addHandler(logging.NullHandler())
 logger.setLevel(logging.INFO)
 
-# Tesseract / OCR availability
+# =====================================================
+# 1. Tesseract / OCR availability
+# =====================================================
 OCR_AVAILABLE = True
 
 if os.name == "nt":
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 try:
     _ = pytesseract.get_tesseract_version()
 except (pytesseract.TesseractNotFoundError, OSError):
@@ -29,9 +34,36 @@ except (pytesseract.TesseractNotFoundError, OSError):
         "OCR fallback will be disabled, pdfplumber-only extraction will be used."
     )
 
+# =====================================================
+# 2. Groq LLM (vision) availability (optional)
+# =====================================================
+GROQ_AVAILABLE = False
+groq_client = None
+GROQ_VISION_MODEL = os.getenv(
+    "GROQ_VISION_MODEL",
+    # replace with exact Groq model ID if needed
+    "llava-v1.5-7b-4096-preview",
+)
+GROQ_API_KEY = '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'
+
+if GROQ_API_KEY:
+    try:
+        from groq import Groq  # type: ignore
+
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        GROQ_AVAILABLE = True
+        logger.info("Groq client initialized; LLM parsing enabled.")
+    except ImportError:
+        logger.warning(
+            "groq package not installed. Run `pip install groq` to enable LLM parsing."
+        )
+else:
+    logger.info("GROQ_API_KEY not set. LLM parsing via Groq is disabled.")
 
 
-#text+ocr extraction
+# =====================================================
+# 3. Text + OCR extraction
+# =====================================================
 def _ocr_extract_text_from_pdf(file_bytes: bytes) -> str:
     """
     Fallback OCR using Tesseract for scanned PDFs.
@@ -68,7 +100,6 @@ def _ocr_extract_text_from_pdf(file_bytes: bytes) -> str:
     full_text = "\n".join(text_chunks)
     logger.info("OCR extracted %d characters from scanned PDF", len(full_text))
     return full_text
-
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -119,11 +150,13 @@ def detect_document_type(full_text: str) -> str:
     if "w-2" in t or "w2" in t or "wage and tax statement" in t:
         return "W-2"
 
+    # Defaulting to W-2 as you had before
     return "W-2"
 
 
 _NUM_RE = re.compile(r"\d[\d,]*\.?\d*")
 _DOLLAR_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)")
+
 
 def _find_labeled_number(
     full_text: str,
@@ -180,6 +213,10 @@ def _find_labeled_number(
 
     return None
 
+
+# =====================================================
+# 4. W-2 parsing (simple layout + general)
+# =====================================================
 def _parse_w2_simple_layout(full_text: str) -> Dict[str, float] | None:
     """
     Special-case parser for your minimal W-2 layout, e.g.:
@@ -205,14 +242,15 @@ def _parse_w2_simple_layout(full_text: str) -> Dict[str, float] | None:
 
     lower_text = full_text.lower()
     label_keywords = [
-        "wages, tips, other", 
+        "wages, tips, other",
         "wage and tax statement",
         "federal income tax withheld",
         "employer's id number",
         "box 1", "box 2",
     ]
     if any(k in lower_text for k in label_keywords):
-        return None 
+        return None
+
     first_idx = 0
     ssn_line = lines[first_idx]
     if not re.fullmatch(r"\d{3}-\d{2}-\d{4}", ssn_line):
@@ -256,27 +294,17 @@ def _parse_w2_simple_layout(full_text: str) -> Dict[str, float] | None:
     return None
 
 
-
 def parse_w2_from_text(full_text: str) -> Dict[str, float]:
     """
     W-2 parser with two layers:
 
       1) _parse_w2_simple_layout:
-         - For your special compact numeric-only W-2:
-             123-45-6789
-             54000.00 5200.00
-             ...
+         - For your special compact numeric-only W-2.
 
-      2) General robust parser (your original logic):
-         - Uses label-based lookup for
-             'Wages, tips, other comp'
-             'Federal income tax withheld'
+      2) General robust parser (original logic):
+         - Uses label-based lookup for wages & federal withholding,
            and falls back to numeric heuristics.
-
-    This way, OCR'd "real" W-2s still use the original robust logic,
-    while your synthetic test W-2s parse cleanly.
     """
-
     simple = _parse_w2_simple_layout(full_text)
     if simple is not None:
         return simple
@@ -308,7 +336,7 @@ def parse_w2_from_text(full_text: str) -> Dict[str, float]:
 
     fed_withholding = _find_labeled_number(
         full_text,
-        r"federal income tax wit\w*",  
+        r"federal income tax wit\w*",
         min_value=10,
         max_value=max_withholding or 1_000_000,
     )
@@ -348,10 +376,13 @@ def parse_w2_from_text(full_text: str) -> Dict[str, float]:
         "federal_withholding": float(fed_withholding or 0.0),
         "interest_income": 0.0,
         "nonemployee_income": 0.0,
-        "ssn": "", 
+        "ssn": "",
     }
 
 
+# =====================================================
+# 5. 1099-INT parsing
+# =====================================================
 def _parse_1099_int_core(full_text: str) -> Dict[str, float]:
     """
     Legacy EIN-based parsing for 1099-INT.
@@ -384,22 +415,7 @@ def _parse_1099_int_core(full_text: str) -> Dict[str, float]:
 def parse_1099_int_from_text(full_text: str) -> Dict[str, float]:
     """
     1099-INT parser tuned for your forms and noisy OCR.
-
-    Phase 1: line/box scan
-      - Read text line by line.
-      - If a line starts with a box number (1, 2, 3, ...), set current_box.
-      - If a line contains '$' and current_box has no value yet, record
-        the first dollar amount on that line for that box.
-
-    Phase 2: Box 1 fallback (for cases where the '$' on 170,000 is lost)
-      - Find the line containing 'interest income'.
-      - Look at that line + the next few lines.
-      - Collect all numeric tokens in that region and choose the largest
-        reasonable one as interest income.
-
-    Phase 3: final fallback to the old core parser if everything is zero.
     """
-
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
     lower_lines = [ln.lower() for ln in lines]
     box_values: Dict[int, float] = {}
@@ -431,8 +447,8 @@ def parse_1099_int_from_text(full_text: str) -> Dict[str, float]:
                         raw,
                     )
 
-    interest = box_values.get(1, 0.0)       
-    fed_withholding = box_values.get(4, 0.0) 
+    interest = box_values.get(1, 0.0)
+    fed_withholding = box_values.get(4, 0.0)
 
     logger.info(
         "1099-INT: after box scan -> box_values=%s, interest=%s, fed_withholding=%s",
@@ -465,7 +481,7 @@ def parse_1099_int_from_text(full_text: str) -> Dict[str, float]:
                     v = float(num_str.replace(",", ""))
                 except ValueError:
                     continue
-                if v < 10:  
+                if v < 10:
                     continue
                 if v > 5_000_000:
                     continue
@@ -497,7 +513,9 @@ def parse_1099_int_from_text(full_text: str) -> Dict[str, float]:
     return result
 
 
-
+# =====================================================
+# 6. 1099-NEC parsing
+# =====================================================
 def _parse_1099_nec_core(full_text: str) -> Dict[str, float]:
     """
     Simple positional fallback, same style as _parse_1099_int_core.
@@ -530,20 +548,7 @@ def _parse_1099_nec_core(full_text: str) -> Dict[str, float]:
 def parse_1099_nec_from_text(full_text: str) -> Dict[str, float]:
     """
     Robust 1099-NEC parser.
-
-    Box 1: Nonemployee compensation
-    Box 4: Federal income tax withheld
-
-    - Phase 1: line/box scan (similar to 1099-INT), but skips the
-      Box 2 '$5,000 or more' phrase when capturing Box 1.
-    - Phase 2: fallback around 'Nonemployee compensation' for Box 1.
-    - Phase 3: fallback around 'Federal income tax withheld' for Box 4,
-      with strong filters so we don't pick state income / other large
-      values by mistake.
-    - Phase 4: final fallback to _parse_1099_nec_core if both Box 1
-      and Box 4 are still zero.
     """
-
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
     lower_lines = [ln.lower() for ln in lines]
     box_values: Dict[int, float] = {}
@@ -588,8 +593,8 @@ def parse_1099_nec_from_text(full_text: str) -> Dict[str, float]:
                         raw,
                     )
 
-    nonemp = box_values.get(1, 0.0)         
-    fed_withholding = box_values.get(4, 0.0) 
+    nonemp = box_values.get(1, 0.0)
+    fed_withholding = box_values.get(4, 0.0)
 
     logger.info(
         "1099-NEC: after box scan -> box_values=%s, nonemp=%s, fed_withholding=%s",
@@ -658,7 +663,7 @@ def parse_1099_nec_from_text(full_text: str) -> Dict[str, float]:
                 "federal" in low
                 and "income" in low
                 and "tax" in low
-                and "with" in low 
+                and "with" in low
             ):
                 label_idx = i
                 break
@@ -750,10 +755,137 @@ def parse_1099_nec_from_text(full_text: str) -> Dict[str, float]:
     return result
 
 
-def analyze_document(file_bytes: bytes) -> Dict[str, Any]:
+# =====================================================
+# 7. Groq LLM-based extraction (optional path)
+# =====================================================
+def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
+    """
+    Use a Groq vision-capable model to read the tax form directly from images.
+
+    Returns:
+      {
+        "document_type": "...",
+        "parsed": {...},
+        "raw_text": "<raw JSON / response from LLM>"
+      }
+    """
+    if not GROQ_AVAILABLE or groq_client is None:
+        raise RuntimeError(
+            "Groq LLM parsing requested but GROQ_API_KEY/groq client is not configured."
+        )
+
+    images_b64: list[str] = []
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages[:2]:
+                img = page.to_image(resolution=200).original.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG")
+                images_b64.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+    except Exception as e:
+        logger.error("Groq LLM: error rendering PDF pages to images: %s", e)
+        raise
+
+    content: list[dict] = [
+        {
+            "type": "text",
+            "text": (
+                "You are reading U.S. tax forms (W-2, 1099-INT, 1099-NEC). "
+                "Extract the key values and return ONLY valid JSON with this schema:\n\n"
+                "{\n"
+                '  \"document_type\": \"W-2\" | \"1099-INT\" | \"1099-NEC\" | \"UNKNOWN\",\n'
+                '  \"ssn\": \"123-45-6789\" | null,\n'
+                '  \"wages\": number,\n'
+                '  \"federal_withholding\": number,\n'
+                '  \"interest_income\": number,\n'
+                '  \"nonemployee_income\": number\n'
+                "}\n\n"
+                "Use 0 for any missing amounts. "
+                "Use document_type \"UNKNOWN\" if you are not confident. "
+                "Do not include any explanation, only the JSON object."
+            ),
+        }
+    ]
+
+    for b64 in images_b64:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64}",
+                },
+            }
+        )
+
+    chat = groq_client.chat.completions.create(
+        model=GROQ_VISION_MODEL,
+        messages=[{"role": "user", "content": content}],
+        temperature=0,
+        max_tokens=512,
+    )
+
+    raw_content = chat.choices[0].message.content
+    if isinstance(raw_content, list):
+        raw_text = "".join(
+            part.get("text", "") for part in raw_content if isinstance(part, dict)
+        )
+    else:
+        raw_text = raw_content or ""
+
+    # Try to parse JSON
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        m = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if not m:
+            logger.error(
+                "Groq LLM: could not find JSON in response (first 500 chars): %r",
+                raw_text[:500],
+            )
+            raise
+        data = json.loads(m.group(0))
+
+    doc_type = (data.get("document_type") or "UNKNOWN").upper()
+
+    parsed = {
+        "wages": float(data.get("wages") or 0.0),
+        "federal_withholding": float(data.get("federal_withholding") or 0.0),
+        "interest_income": float(data.get("interest_income") or 0.0),
+        "nonemployee_income": float(data.get("nonemployee_income") or 0.0),
+        "ssn": (data.get("ssn") or "").strip(),
+    }
+
+    return {
+        "document_type": doc_type,
+        "parsed": parsed,
+        "raw_text": raw_text,
+    }
+
+
+# =====================================================
+# 8. Main entrypoint
+# =====================================================
+def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]:
     """
     Main entrypoint called from app.py.
+
+    - If use_llm=True and Groq is configured, we try LLM vision parsing first.
+    - If that fails (or use_llm=False), we fall back to the existing
+      pdfplumber/OCR + regex-based parsing you already had.
     """
+
+    # 1) Optional Groq LLM path
+    if use_llm:
+        try:
+            logger.info("Using Groq LLM parsing path for this document.")
+            return _groq_llm_extract_from_pdf(file_bytes)
+        except Exception as e:
+            logger.error(
+                "Groq LLM parsing failed, falling back to rule-based parsing: %s",
+                e,
+            )
+
+    # 2) Existing rule-based / OCR path (unchanged behavior)
     raw_text = extract_text_from_pdf(file_bytes)
     logger.info("First 500 chars of extracted text:\n%s", raw_text[:500])
     doc_type = detect_document_type(raw_text)
@@ -783,4 +915,5 @@ def analyze_document(file_bytes: bytes) -> Dict[str, Any]:
         "document_type": parsed["document_type"],
         "parsed": parsed,
         "raw_text": raw_text,
+        "parser_used": ("GROQ_LLM" if use_llm else "RULE_BASED"),
     }

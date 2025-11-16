@@ -24,6 +24,9 @@ def generate_1040_pdf(
     and return the filled PDF as an in-memory buffer.
     """
 
+    # --------------------------
+    # 1. Personal info
+    # --------------------------
     first_name = (personal_info.get("first_name") or "").strip()
     middle_initial = (personal_info.get("middle_initial") or "").strip()
     last_name = (personal_info.get("last_name") or "").strip()
@@ -50,21 +53,39 @@ def generate_1040_pdf(
     ssn_input = (personal_info.get("ssn") or "").strip()
     filing_status = personal_info.get("filing_status", "")
 
+    # --------------------------
+    # 2. Income inputs
+    # --------------------------
     wages = float(income_data.get("wages", 0.0))
     interest_income = float(income_data.get("interest_income", 0.0))
     nonemployee_income = float(income_data.get("nonemployee_income", 0.0))
     total_withholding = float(income_data.get("federal_withholding", 0.0))
 
+    # --------------------------
+    # 3. Tax summary inputs
+    # --------------------------
+    # total_income = line 9 (wages + interest + nonemployee, etc.)
     total_income = float(tax_summary.get("total_income", 0.0))
+
+    # Self-employment deduction (Schedule 1) and AGI from the new tax engine
+    se_deduction = float(tax_summary.get("se_deduction", 0.0))
+    agi = float(tax_summary.get("agi", total_income - se_deduction))
+
     standard_deduction = float(tax_summary.get("standard_deduction", 0.0))
     taxable_income = float(tax_summary.get("taxable_income", 0.0))
+
+    # tax_liability should now be total federal tax (income tax + SE tax)
     tax_liability = float(tax_summary.get("tax_liability", 0.0))
     refund = float(tax_summary.get("refund", 0.0))
     amount_owed = float(tax_summary.get("amount_owed", 0.0))
 
-    adjusted_gross_income = total_income
+    # For this prototype, total payments = federal withholding only
+    adjusted_gross_income = agi
     total_payments = total_withholding
 
+    # --------------------------
+    # 4. Prepare PDF template
+    # --------------------------
     template_reader = PdfReader(TEMPLATE_PATH)
     first_page = template_reader.pages[0]
     mediabox = first_page.mediabox
@@ -75,17 +96,19 @@ def generate_1040_pdf(
     c = canvas.Canvas(overlay_packet, pagesize=(page_width, page_height))
 
     # X-position for numeric amount column
-    amount_x = page_width - 55 
+    amount_x = page_width - 55
 
+    # ==========================
     # PAGE 1 overlay
+    # ==========================
     c.setFont("Helvetica", 10)
 
-    #Name & SSN
+    # --- Name & SSN block ---
     taxpayer_name_left = " ".join(
         part for part in [first_name, middle_initial] if part
     ).strip()
     if not taxpayer_name_left and last_name:
-        taxpayer_name_left = last_name 
+        taxpayer_name_left = last_name
 
     if not taxpayer_name_left and not last_name:
         taxpayer_name_left = ""
@@ -104,6 +127,7 @@ def generate_1040_pdf(
         c.drawString(55, spouse_y, spouse_name_left)
         c.drawString(255, spouse_y, spouse_last_name)
 
+    # SSN digits
     ssn_clean = ssn_input.replace("-", "")
     if not ssn_clean:
         ssn_clean = "000000000"
@@ -115,8 +139,8 @@ def generate_1040_pdf(
 
     c.setFont("Helvetica-Bold", 11)
 
-    base_x = page_width - 134   
-    base_y = page_height - 99 
+    base_x = page_width - 134
+    base_y = page_height - 99
     digit_spacing = 6
     group_gap = 8
 
@@ -135,7 +159,7 @@ def generate_1040_pdf(
         c.drawString(x, base_y, ch)
         x += digit_spacing
 
-    # 3b. Address lines
+    # --- Address lines ---
     c.setFont("Helvetica-Bold", 10)
 
     addr_y = page_height - 146
@@ -162,13 +186,10 @@ def generate_1040_pdf(
         if foreign_postal_code:
             c.drawString(410, foreign_y, foreign_postal_code)
 
-    # 3c. Filing status===
-    # Left column check boxes: Single, MFJ, MFS
-    status_left_x = 103
-    # Right column check boxes: HOH, QSS
-    status_right_x = 370
+    # --- Filing status checkboxes ---
+    status_left_x = 103     # Single, MFJ, MFS
+    status_right_x = 370    # HOH, QSS
 
-    # Y positions (measured off your form screenshot)
     status_single_y = page_height - 210    # Single
     status_mfj_y    = page_height - 221    # Married filing jointly
     status_mfs_y    = page_height - 233    # Married filing separately
@@ -188,10 +209,8 @@ def generate_1040_pdf(
     elif filing_status == "Qualifying surviving spouse (QSS)":
         c.drawString(status_right_x, status_qss_y, "X")
 
-    # 3c.1 Text on the "If you checked MFS / HOH / QSS" line
-    # This is the dashed line right under the status boxes.
-    line_mfs_hoh_y = page_height - 254 
-
+    # "If you checked MFS/HOH/QSS" line
+    line_mfs_hoh_y = page_height - 254
     c.setFont("Helvetica-Bold", 9.5)
     text_on_line = ""
     if filing_status == "Married Filing Separately":
@@ -210,9 +229,9 @@ def generate_1040_pdf(
     if text_on_line:
         c.drawString(310, line_mfs_hoh_y, text_on_line)
 
-    # 3c.2 Last checkbox: nonresident/dual-status spouse treated as U.S. resident 
-    nra_box_x = status_left_x      
-    nra_box_y = page_height - 267 
+    # Nonresident / dual-status spouse box
+    nra_box_x = status_left_x
+    nra_box_y = page_height - 267
     nra_name_y = page_height - 281
 
     if treat_nra_spouse:
@@ -222,14 +241,14 @@ def generate_1040_pdf(
             c.setFont("Helvetica-Bold", 9.5)
             c.drawString(340, nra_name_y, nra_spouse_name)
 
-    # 3d. Income lines – fine-tuned to 2024 Form 1040 
-    line1_y = 355    # Line 1: Wages
-    line2b_y = 236   # Line 2b: Taxable interest
-    line8_y = 153    # Line 8: Other income
-    line9_y = 140    # Line 9: Total income
-    line11_y = 115   # Line 11: AGI
-    line12_y = 104   # Line 12: Standard deduction
-    line15_y = 69    # Line 15: Taxable income
+    # --- Income lines (2024 1040 layout) ---
+    line1_y = 355   # Line 1: wages
+    line2b_y = 236  # Line 2b: taxable interest
+    line8_y = 153   # Line 8: other income (we use nonemployee comp)
+    line9_y = 140   # Line 9: total income
+    line11_y = 115  # Line 11: AGI
+    line12_y = 104  # Line 12: standard deduction
+    line15_y = 69   # Line 15: taxable income
 
     c.setFont("Helvetica-Bold", 10)
     c.drawRightString(amount_x, line1_y, _fmt_money(wages))
@@ -240,15 +259,18 @@ def generate_1040_pdf(
     c.drawRightString(amount_x, line12_y, _fmt_money(standard_deduction))
     c.drawRightString(amount_x, line15_y, _fmt_money(taxable_income))
 
+    # Finish page 1
     c.showPage()
 
-    # 4. PAGE 2 overlay
+    # ==========================
+    # PAGE 2 overlay
+    # ==========================
     c.setFont("Helvetica-Bold", 10)
 
     line24_y = 650   # Line 24: total tax
-    line33_y = 494.5   # Line 33: total payments
+    line33_y = 494.5 # Line 33: total payments
     line34_y = 481   # Line 34: refund
-    line37_y = 410   # Line 37: amount you owe
+    line37_y = 410   # Line 37: amount owed
 
     c.drawRightString(amount_x, line24_y, _fmt_money(tax_liability))
     c.drawRightString(amount_x, line33_y, _fmt_money(total_payments))
@@ -261,7 +283,9 @@ def generate_1040_pdf(
 
     overlay_reader = PdfReader(overlay_packet)
 
+    # --------------------------
     # 5. Merge overlay onto template
+    # --------------------------
     writer = PdfWriter()
     for i, base_page in enumerate(template_reader.pages):
         page = base_page
@@ -270,7 +294,9 @@ def generate_1040_pdf(
             page.merge_page(overlay_page)
         writer.add_page(page)
 
-    # 6. Return final PDF 
+    # --------------------------
+    # 6. Return final PDF
+    # --------------------------
     output_buffer = BytesIO()
     writer.write(output_buffer)
     output_buffer.seek(0)
