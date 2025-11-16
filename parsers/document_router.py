@@ -43,7 +43,7 @@ groq_client = None
 GROQ_VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL",
     # replace with exact Groq model ID if needed
-    "llama-3.2-90b-vision-preview",
+    "llama-3.2-11b-vision-preview",
 )
 GROQ_API_KEY = (
         st.secrets.get("API_KEY")
@@ -65,46 +65,67 @@ if GROQ_API_KEY:
 else:
     logger.info("GROQ_API_KEY not set. LLM parsing via Groq is disabled.")
 
-# in document_router.py (or a separate groq_vision_ocr.py)
 from typing import Tuple
 
 def extract_text_with_groq_vision(file_bytes: bytes) -> Tuple[str, str]:
     """
-    Try Groq Vision to read the PDF.
+    Try Groq Vision to read the PDF (first 1–2 pages rendered as images).
     Returns (text, status_string).
-    status_string examples:
-      - 'GROQ_VISION_OK'
-      - 'GROQ_VISION_DISABLED: <reason>'
-      - 'GROQ_VISION_ERROR: <error...>'
     """
-    from ai_advisor import _get_groq_client  # or duplicate the same helper
+    from ai_advisor import _get_groq_client  # reuse same Groq init
 
     client, err = _get_groq_client()
     if err:
         return "", f"GROQ_VISION_DISABLED: {err}"
 
     try:
-        b64_pdf = base64.b64encode(file_bytes).decode("utf-8")
+        import pdfplumber
+        import base64
+        from PIL import Image
+        import io
+    except Exception as e:
+        return "", f"GROQ_VISION_DISABLED: missing deps for PDF/image: {e}"
+
+    # 1) Render first 2 pages of PDF to JPEG images
+    image_parts = []
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages[:2]:
+                img = page.to_image(resolution=200).original.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                image_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}",
+                        },
+                    }
+                )
+    except Exception as e:
+        return "", f"GROQ_VISION_ERROR: failed to render PDF pages: {e}"
+
+    if not image_parts:
+        return "", "GROQ_VISION_ERROR: no pages/images found in PDF"
+
+    # 2) Call Groq vision model with OpenAI-style schema
+    try:
         completion = client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview",
+            model="llama-3.2-11b-vision-preview",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an OCR engine for US tax forms. Extract all visible text."
+                    "content": "You are an OCR engine for US tax forms. Extract all visible text and preserve line breaks.",
                 },
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "input_text",
-                            "text": "Extract all text from this tax document PDF. Preserve line breaks."
+                            "type": "text",
+                            "text": "Extract all text from this tax document (W-2 / 1099-INT / 1099-NEC).",
                         },
-                        {
-                            "type": "input_image",
-                            "image_url": {
-                                "url": f"data:application/pdf;base64,{b64_pdf}"
-                            }
-                        },
+                        *image_parts,
                     ],
                 },
             ],
@@ -119,12 +140,16 @@ def extract_text_with_groq_vision(file_bytes: bytes) -> Tuple[str, str]:
                 for part in content
             )
         else:
-            text = str(content)
+            text = str(content or "")
+
+        if not text.strip():
+            return "", "GROQ_VISION_ERROR: empty response from model"
 
         return text, "GROQ_VISION_OK"
 
     except Exception as e:
         return "", f"GROQ_VISION_ERROR: {e}"
+
 
 
 
@@ -841,6 +866,7 @@ def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
             "Groq LLM parsing requested but GROQ_API_KEY/groq client is not configured."
         )
 
+    # 1) Render first 1–2 pages as JPEGs
     images_b64: list[str] = []
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -853,6 +879,10 @@ def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
         logger.error("Groq LLM: error rendering PDF pages to images: %s", e)
         raise
 
+    if not images_b64:
+        raise RuntimeError("Groq LLM: no images rendered from PDF")
+
+    # 2) Build multimodal content (OpenAI-style)
     content: list[dict] = [
         {
             "type": "text",
@@ -884,9 +914,15 @@ def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
             }
         )
 
+    # 3) Call Groq Vision model
     chat = groq_client.chat.completions.create(
-        model=GROQ_VISION_MODEL,
-        messages=[{"role": "user", "content": content}],
+        model=GROQ_VISION_MODEL,  # now llama-3.2-11b-vision-preview
+        messages=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
         temperature=0,
         max_tokens=512,
     )
@@ -899,7 +935,7 @@ def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
     else:
         raw_text = raw_content or ""
 
-    # Try to parse JSON
+    # 4) Parse JSON from model output
     try:
         data = json.loads(raw_text)
     except Exception:
@@ -935,71 +971,52 @@ def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
 def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]:
     """
     Main entrypoint called from app.py.
-
-    If use_llm=True, we FIRST try Groq vision JSON parser.
-    - If it works, we return that directly.
-    - If it fails, we fall back to rule-based parsing and record the error in parser_used.
     """
-    parser_used = "RULE_BASED"
-    raw_text = ""
+    parser_used = "rule-based"
+    llm_result = None
 
-    # =========================
-    # 1) Try Groq Vision first
-    # =========================
     if use_llm:
         try:
             llm_result = _groq_llm_extract_from_pdf(file_bytes)
-            # llm_result has: document_type, parsed, raw_text
-            doc_type = llm_result["document_type"]
-            parsed = llm_result["parsed"]
-            raw_text = llm_result.get("raw_text", "") or ""
-
-            parser_used = "GROQ_VISION_JSON"
-            parsed["document_type"] = doc_type
-            parsed["parser_used"] = parser_used
-
-            return {
-                "document_type": doc_type,
-                "parsed": parsed,
-                "raw_text": raw_text,
-            }
+            parser_used = "groq-vision-json"
         except Exception as e:
-            # Log & fall back to legacy pipeline
-            logger.error("Groq LLM parsing failed, falling back to rule-based: %s", e)
+            logger.error("Groq LLM parse failed, falling back: %s", e)
             parser_used = f"GROQ_VISION_ERROR: {e}"
+            llm_result = None
 
-    # ===================================
-    # 2) Legacy text + rule-based parsing
-    # ===================================
-    if not raw_text:
-        raw_text = extract_text_from_pdf(file_bytes)
-
-    logger.info("First 500 chars of extracted text:\n%s", raw_text[:500])
-    doc_type = detect_document_type(raw_text)
-    logger.info("Detected document type: %s", doc_type)
-
-    if doc_type == "W-2":
-        parsed = parse_w2_from_text(raw_text)
-    elif doc_type == "1099-INT":
-        parsed = parse_1099_int_from_text(raw_text)
-    elif doc_type == "1099-NEC":
-        parsed = parse_1099_nec_from_text(raw_text)
+    if llm_result is not None:
+        # We fully trust the LLM JSON extract here; no rule-based parsing.
+        parsed = llm_result["parsed"]
+        raw_text = llm_result["raw_text"]
+        doc_type = llm_result["document_type"]
     else:
-        parsed = {
-            "document_type": "UNKNOWN",
-            "wages": 0.0,
-            "interest_income": 0.0,
-            "nonemployee_income": 0.0,
-            "federal_withholding": 0.0,
-        }
+        # Normal text extraction + rule-based parsing
+        raw_text = extract_text_from_pdf(file_bytes)
+        logger.info("First 500 chars of extracted text:\n%s", raw_text[:500])
 
-    # Attach parser_used so UI can show “rule-based”, “GROQ_VISION_ERROR: …”, etc.
+        doc_type = detect_document_type(raw_text)
+        logger.info("Detected document type: %s", doc_type)
+
+        if doc_type == "W-2":
+            parsed = parse_w2_from_text(raw_text)
+        elif doc_type == "1099-INT":
+            parsed = parse_1099_int_from_text(raw_text)
+        elif doc_type == "1099-NEC":
+            parsed = parse_1099_nec_from_text(raw_text)
+        else:
+            parsed = {
+                "document_type": "UNKNOWN",
+                "wages": 0.0,
+                "interest_income": 0.0,
+                "nonemployee_income": 0.0,
+                "federal_withholding": 0.0,
+            }
+
+    parsed["document_type"] = doc_type
     parsed["parser_used"] = parser_used
-    if "document_type" not in parsed:
-        parsed["document_type"] = doc_type
 
     return {
-        "document_type": parsed["document_type"],
+        "document_type": doc_type,
         "parsed": parsed,
         "raw_text": raw_text,
     }
