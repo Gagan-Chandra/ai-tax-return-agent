@@ -939,7 +939,7 @@ def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]
     parser_used = "LEGACY"
 
     if use_llm:
-        llm_text, status = extract_text_with_groq_vision(file_bytes)
+        llm_text, status = _groq_llm_extract_from_pdf(file_bytes)
         if status == "GROQ_VISION_OK" and llm_text.strip():
             raw_text = llm_text
             parser_used = "GROQ_VISION"
