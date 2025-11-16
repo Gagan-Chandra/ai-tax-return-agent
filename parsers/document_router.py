@@ -43,7 +43,7 @@ groq_client = None
 GROQ_VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL",
     # replace with exact Groq model ID if needed
-    "llava-v1.5-7b-4096-preview",
+    "llama-3.2-90b-vision-preview",
 )
 GROQ_API_KEY = (
         st.secrets.get("API_KEY")
@@ -935,19 +935,43 @@ def _groq_llm_extract_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
 def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]:
     """
     Main entrypoint called from app.py.
-    """
-    parser_used = "LEGACY"
 
+    If use_llm=True, we FIRST try Groq vision JSON parser.
+    - If it works, we return that directly.
+    - If it fails, we fall back to rule-based parsing and record the error in parser_used.
+    """
+    parser_used = "RULE_BASED"
+    raw_text = ""
+
+    # =========================
+    # 1) Try Groq Vision first
+    # =========================
     if use_llm:
-        llm_text, status = _groq_llm_extract_from_pdf(file_bytes)
-        if status == "GROQ_VISION_OK" and llm_text.strip():
-            raw_text = llm_text
-            parser_used = "GROQ_VISION"
-        else:
-            # Fallback to normal pipeline
-            raw_text = extract_text_from_pdf(file_bytes)
-            parser_used = status  # so UI can show *why* LLM wasn’t used
-    else:
+        try:
+            llm_result = _groq_llm_extract_from_pdf(file_bytes)
+            # llm_result has: document_type, parsed, raw_text
+            doc_type = llm_result["document_type"]
+            parsed = llm_result["parsed"]
+            raw_text = llm_result.get("raw_text", "") or ""
+
+            parser_used = "GROQ_VISION_JSON"
+            parsed["document_type"] = doc_type
+            parsed["parser_used"] = parser_used
+
+            return {
+                "document_type": doc_type,
+                "parsed": parsed,
+                "raw_text": raw_text,
+            }
+        except Exception as e:
+            # Log & fall back to legacy pipeline
+            logger.error("Groq LLM parsing failed, falling back to rule-based: %s", e)
+            parser_used = f"GROQ_VISION_ERROR: {e}"
+
+    # ===================================
+    # 2) Legacy text + rule-based parsing
+    # ===================================
+    if not raw_text:
         raw_text = extract_text_from_pdf(file_bytes)
 
     logger.info("First 500 chars of extracted text:\n%s", raw_text[:500])
@@ -969,12 +993,15 @@ def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]
             "federal_withholding": 0.0,
         }
 
-    # attach parser_used so app.py can display it
+    # Attach parser_used so UI can show “rule-based”, “GROQ_VISION_ERROR: …”, etc.
     parsed["parser_used"] = parser_used
+    if "document_type" not in parsed:
+        parsed["document_type"] = doc_type
 
     return {
         "document_type": parsed["document_type"],
         "parsed": parsed,
         "raw_text": raw_text,
     }
+
 
