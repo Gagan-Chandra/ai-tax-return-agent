@@ -852,15 +852,17 @@ def analyze_document(file_bytes: bytes, use_llm: bool = False) -> Dict[str, Any]
 
     # 3) Optional Groq LLM parsing from text
     if use_llm:
-        try:
-            llm_result = _groq_llm_parse_from_text(raw_text)
-            parsed = llm_result["parsed"]
-            # Allow the LLM to override document_type if it thinks it's different
-            doc_type = llm_result.get("document_type", doc_type)
-            parser_used = "Groq LLM (from OCR text)"
-        except Exception as e:
-            logger.error("Groq LLM parsing failed; falling back to rule-based: %s", e)
-            parser_used = f"Groq LLM ERROR (fallback to rules): {e}"
+        if raw_text.strip():
+            try:
+                llm_result = _groq_llm_parse_from_text(raw_text)
+                parsed = llm_result["parsed"]
+                doc_type = llm_result.get("document_type", doc_type)
+                parser_used = "Groq LLM (from OCR text)"
+            except Exception as e:
+                logger.error("Groq LLM parsing failed; falling back to rule-based: %s", e)
+                parser_used = f"Groq LLM ERROR (fallback to rules): {e}"
+        else:
+            parser_used = "Groq LLM disabled (no text extracted)"
 
     # 4) Rule-based parsing if LLM not used or failed
     if parsed is None:

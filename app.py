@@ -1118,32 +1118,27 @@ if results is not None:
         if mode == "Use uploaded PDFs (real forms)" and file_results:
             st.subheader("Per-file Extraction Details (Validation on Original Forms)")
             for file_result in file_results:
-                parser_label = file_result.get("parser_used", "rule-based")
+                parsed_safe = dict(file_result["parsed"])
+
+                detected_type = parsed_safe.get("document_type", file_result["document_type"])
+                parser_used = parsed_safe.get("parser_used", "rule-based")
+
                 st.markdown(
-                    f"**File:** `{file_result['filename']}`  |  "
-                    f"Detected type: `{file_result['document_type']}`  |  "
-                    f"Parser used: `{parser_label}`"
+                    f"**File:** `{file_result['filename']}`  |  Detected type: `{detected_type}`  |  Parser used: `{parser_used}`"
                 )
                 st.write("Parsed fields used from this file:")
-                if "GROQ_VISION_DISABLED" in file_result["parsed"].get("parser_used", ""):
-                    st.warning("Groq Vision was not available in this deployment. "
-                            "Check GROQ_API_KEY and requirements.txt.")
-                elif "GROQ_VISION_ERROR" in file_result["parsed"].get("parser_used", ""):
-                    st.warning(f"Groq Vision error: {file_result['parsed']['parser_used']}")
 
                 # Mask SSN if present before showing parsed data
-                parsed_safe = dict(file_result["parsed"])
                 if "ssn" in parsed_safe and parsed_safe["ssn"]:
                     s = str(parsed_safe["ssn"])
                     parsed_safe["ssn"] = "***-**-" + s[-4:]
 
-                # Warn in UI if everything came out as zero
                 w = float(parsed_safe.get("wages", 0.0))
-                i = float(parsed_safe.get("interest_income", 0.0))
-                n = float(parsed_safe.get("nonemployee_income", 0.0))
-                fw = float(parsed_safe.get("federal_withholding", 0.0))
+                i_ = float(parsed_safe.get("interest_income", 0.0))
+                n_ = float(parsed_safe.get("nonemployee_income", 0.0))
+                fw_ = float(parsed_safe.get("federal_withholding", 0.0))
 
-                if w == 0 and i == 0 and n == 0 and fw == 0:
+                if w == 0 and i_ == 0 and n_ == 0 and fw_ == 0:
                     st.warning(
                         "No numeric income values were detected in this file. "
                         "It may be blank, scanned/low-quality, or not in the expected format."
@@ -1153,5 +1148,3 @@ if results is not None:
 
                 with st.expander("Show raw extracted text from this PDF"):
                     st.text(file_result["raw_text"])
-        elif mode == "Enter income manually (debug mode)":
-            st.info("Manual mode: no PDF parsing details to show.")
